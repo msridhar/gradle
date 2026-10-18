@@ -558,6 +558,28 @@ To help you understand how incremental compilation works, the following provides
 * Having a source structure that does not match the package names, while legal for compilation, might end up causing trouble in the toolchain.
     Even more if annotation processing and <<build_cache.adoc#build_cache,caching>> are involved.
 
+[[sec:compiler_plugin_classloader_reuse]]
+== Reusing javac plugin classloaders
+
+Java compilation tasks can opt in to sharing javac plugin classloaders between compilations in the same compiler JVM:
+
+[source,kotlin]
+----
+tasks.withType<JavaCompile>().configureEach {
+    options.compilerPluginClassLoaderReuse = true
+}
+----
+
+This incubating option defaults to `false` and applies to plugins loaded from the annotation processor path, including Error Prone checks.
+It only applies when using the Java compiler API.
+Standard annotation processors instantiated directly by Gradle continue to use fresh classloaders.
+Plugin instances and javac contexts are created for each compilation.
+
+Plugins and their dependencies must avoid mutable static state and static references to compilation objects, including static maps that retain compiler contexts, symbols, or syntax trees.
+Concurrent compilations may share the same classloader.
+Changed classpath contents cause a new classloader to be used, and unused loaders are evicted from a bounded process-local cache.
+Reuse ends when the compiler JVM exits.
+
 [[sec:incremental_annotation_processing]]
 == Incremental annotation processing
 

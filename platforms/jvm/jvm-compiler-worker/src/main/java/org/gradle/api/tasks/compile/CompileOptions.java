@@ -88,10 +88,12 @@ public abstract class CompileOptions implements Serializable {
 
     private FileCollection annotationProcessorPath;
 
+    private final Property<Boolean> compilerPluginClassLoaderReuse;
+
     @Inject
     @SuppressWarnings("unused")
     public CompileOptions(ObjectFactory objectFactory) {
-
+        compilerPluginClassLoaderReuse = objectFactory.property(Boolean.class).convention(false);
     }
 
     /**
@@ -471,6 +473,23 @@ public abstract class CompileOptions implements Serializable {
      */
     public void setAnnotationProcessorPath(@Nullable FileCollection annotationProcessorPath) {
         this.annotationProcessorPath = annotationProcessorPath;
+    }
+
+    /**
+     * Allows reusing the classloader for javac plugins on the annotation processor path between compilations.
+     * Defaults to {@code false}. Only applies when compiling with the Java compiler API.
+     * <p>
+     * Opting in requires plugins and their dependencies to avoid mutable static state and static references
+     * to compilation state. A cached classloader can be shared by concurrent compilations.
+     * Plugin instances and compiler contexts are still created for every compilation.
+     * Standard annotation processors loaded directly by Gradle continue to use fresh classloaders.
+     *
+     * @since 9.9.0
+     */
+    @Incubating
+    @Internal
+    public Property<Boolean> getCompilerPluginClassLoaderReuse() {
+        return compilerPluginClassLoaderReuse;
     }
 
     /**

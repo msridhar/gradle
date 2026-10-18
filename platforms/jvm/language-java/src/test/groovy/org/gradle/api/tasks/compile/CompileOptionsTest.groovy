@@ -42,6 +42,7 @@ class CompileOptionsTest extends Specification {
         !compileOptions.listFiles
         !compileOptions.verbose
         !compileOptions.fork
+        !compileOptions.compilerPluginClassLoaderReuse.get()
 
         compileOptions.compilerArgs.empty
         compileOptions.encoding == null

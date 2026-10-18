@@ -1,0 +1,68 @@
+= Measured results
+
+Recorded on macOS 15.7.9 (`arm64`), Temurin 25.0.4.1.
+
+The completed prototype was measured using the Gradle development distribution built from this checkout, based on commit `cf62537f12da36410a3b02b1ae24b2b7bdfe4c82`.
+
+== End-to-end Gradle builds
+
+[cols="2,1,1,1,1",options="header"]
+|===
+|Compiler workers |Reuse disabled |Reuse enabled |Speedup |Lower wall time
+|1 |6.757 s |2.000 s |3.38x |70.4%
+|4 |2.892 s |1.107 s |2.61x |61.7%
+|===
+
+Each number is a median: six measured builds per variant with one worker, four with four workers. Two warmup builds per variant are excluded. Both variants reuse Gradle and compiler JVMs.
+
+The fixture has 16 independent modules and 40,032 lines of Java. All 16 compile tasks ran on every build. Build caching and incremental compilation were disabled; configuration caching and compiler workers were enabled. Error Prone 2.50.0 runs NullAway 0.14.2 with other Error Prone checks disabled. The ordinary Error Prone and NullAway Gradle plugins configure the build.
+
+The measurements include full classpath content hashing on each compiler invocation. They cover a synthetic workload on one machine.
+
+== Small incremental builds, build cache enabled
+
+[cols="2,1,1,1,1",options="header"]
+|===
+|Edit scenario |Compiler workers |Reuse disabled |Reuse enabled |Speedup
+|One file in one module; other 15 modules up-to-date |1 |0.680 s |0.489 s |1.39x
+|One file in each of 16 modules |4 |1.483 s |0.680 s |2.18x
+|===
+
+Each number is a median of sixteen measured builds per variant after six warmups per variant.
+Both incremental compilation and the build cache are enabled; the command is `compileJava --build-cache --info`, without forced reruns.
+Each invocation makes a unique non-ABI method-body edit in the selected `Example0.java` files, causing cache misses while keeping cache lookups and writes active.
+Gradle's task outcomes, source-file listings, one-class incremental counts, and output class-file hashes are checked for every invocation.
+All measured builds reused the configuration cache.
+Seed builds restored cached outputs, and no-change controls were up-to-date in both reuse modes.
+
+The single changed compile task fell from a median of 240.5 to 48.5 ms (4.96x); approximately 440 ms of other build work limits the end-to-end gain to 28.0%.
+In the parallel batch, summed executed compile-task time fell from 4,104.0 to 897.5 ms (4.57x); that sum includes overlapping work and is not elapsed time.
+The parallel batch's end-to-end time fell by 54.1%.
+
+The workload remains synthetic; this follow-up uses the unchanged completed prototype and the same versions as the full-recompilation experiment.
+The incremental section of `results.json` includes raw samples, parameters, summaries, and provenance.
+
+== Exploratory compiler-only measurements
+
+An earlier experiment isolated repeated javac invocations in one JVM. It used the same loader-reuse approach before the final JAR-invalidation hardening, compiled against the wrapper milestone. These figures explain the opportunity; the end-to-end table above was rerun on the completed implementation.
+
+[cols="2,1,1,1",options="header"]
+|===
+|Analysis |Fresh loader |Reused loader |Speedup
+|NullAway, other Error Prone checks disabled |427.9 ms |112.2 ms |3.81x
+|Error Prone default checks, NullAway disabled |867.8 ms |356.7 ms |2.43x
+|===
+
+Four JVM forks per variant; each fork had six warmups and sixteen measured compilations of one 2,502-line module. Variant order alternated by fork.
+
+The NullAway variant loaded about 1,651 classes per measured invocation with fresh loaders and fewer than one on average with reuse. Error Prone default checks loaded about 2,302 versus fewer than one. JVM-wide JIT time is recorded in the raw data; it includes all JVM compilation activity and asynchronous compilation, so it is not a measurement of plugin-only JIT time.
+
+== Correctness checks
+
+* 9 cache tests passed, including concurrent sharing, content and resource invalidation, changed JARs shared by different classpaths, eviction, and deferred closure.
+* 5 compile-option tests passed.
+* 4 integration cases passed: opt-in on/off, fork on/off, reuse across tasks and builds, and fresh standard annotation processor loaders.
+* The completed prototype reported an intentional NullAway error, then compiled successfully after its removal with reuse enabled.
+* Both reuse modes reported a real NullAway error during a one-class incremental compilation and successfully executed a one-class incremental recovery with the build cache enabled.
+
+See `README.adoc` for reproduction steps and remaining production work. `results.json` contains raw samples, source hashes, parameters, and validation metadata.

@@ -1,0 +1,441 @@
+= Reusing javac plugin classloaders in Gradle
+:toc:
+:toclevels: 2
+
+Investigation and prototype report, October 17, 2026 (Pacific time).
+Prepared as supporting material for an upstream Gradle feature discussion.
+
+== Findings
+
+Gradle can avoid substantial repeated startup work for Error Prone and NullAway by retaining their classloader across compilations in a persistent compiler JVM.
+The prototype adds an explicit, disabled-by-default opt-in and shares one loader for a matching plugin classpath and parent loader.
+It creates fresh plugin instances and compiler contexts for each compilation.
+
+In a synthetic 16-module build, retaining the plugin loader reduced median end-to-end build time from 6.757 to 2.000 seconds with one compiler worker, and from 2.892 to 1.107 seconds with four workers.
+Both variants already reuse the Gradle daemon, compiler worker JVMs, and javac classes.
+The additional benefit comes from retaining the separately loaded plugin classes and their warmup.
+
+The results justify an upstream design discussion.
+They establish an opportunity on this workload, rather than an expected speedup for arbitrary builds.
+The follow-up incremental experiment uses one-file method-body edits, with both incremental compilation and the build cache enabled.
+For one edited file in one module, median end-to-end build time fell from 0.680 to 0.489 seconds (1.39x), while the changed compile task fell from 240.5 to 48.5 milliseconds (4.96x).
+A batch editing one file in each of the 16 modules fell from 1.483 to 0.680 seconds with four workers (2.18x).
+Real-project measurements and long-running memory measurements remain to be done.
+
+The implementation assumes that opting-in plugins and their dependencies avoid mutable static state and references that retain compilation objects.
+It does not allocate additional loaders to isolate concurrent compilations or attempt to reset plugin state.
+
+== Current behavior and the performance problem
+
+=== javac plugins and annotation processors have separate loading paths
+
+Error Prone is a javac plugin, enabled with `-Xplugin:ErrorProne`.
+NullAway runs as an Error Prone check.
+Although their artifacts normally appear on Gradle's annotation processor path, they are not ordinary JSR 269 annotation processors.
+
+There are two relevant paths in the Gradle sources inspected:
+
+* `AnnotationProcessingCompileTask` creates a fresh `URLClassLoader`, instantiates ordinary annotation processors, and supplies them to javac.
+* `GradleStandardJavaFileManager.getClassLoader(ANNOTATION_PROCESSOR_PATH)` supplies the loader javac uses to discover compiler plugins. Without the new opt-in, this returns a fresh loader over the processor path with a filtered parent.
+
+The prototype changes the second path.
+Ordinary annotation processors continue to use the first path with fresh loaders.
+The term "compiler plugin" in the proposed property refers to javac plugins and their checks, not Gradle build plugins.
+
+=== The baseline already retains javac
+
+`JavaHomeBasedJavaCompilerFactory` has a static cache of `JdkTools`, keyed by Gradle's compiler-support classpath.
+Its source explicitly describes classloader reuse in compiler workers as important for performance.
+`JdkTools` creates fresh `JavacTool` objects, while javac's class definitions remain loaded in the persistent compiler JVM.
+`DaemonJavaCompiler` configures compiler workers with daemon keep-alive behavior.
+
+Consequently, creating a new compiler object or task is different from loading javac's classes again.
+The benchmark control retains javac's class identities and can retain its JIT-compiled code.
+It repeatedly discards the separately loaded Error Prone/NullAway classes.
+
+=== Why incremental builds are relevant
+
+When incremental compilation actually invokes javac for a small set of changed sources, the fresh plugin loader still has to define the plugin classes used by that invocation.
+This includes dependencies defined by that loader; classes supplied by shared parent loaders remain available.
+Loading is lazy, so this does not mean every class in every plugin JAR must be loaded.
+
+Reducing the number of source files does not remove this repeated initialization and warmup work.
+The incremental measurements below exercise this case directly; the original full-recompilation measurements remain a separate experiment.
+Up-to-date tasks and tasks restored from the build cache avoid invoking javac altogether.
+
+== Proposed public behavior
+
+The prototype exposes an incubating property on `CompileOptions`:
+
+[source,kotlin]
+----
+tasks.withType<JavaCompile>().configureEach {
+    options.compilerPluginClassLoaderReuse.set(true)
+}
+----
+
+The property defaults to `false` and is serialized into `MinimalJavaCompileOptions` for the compiler worker.
+It is annotated `@Internal`: reuse is an execution optimization and, under the compatibility contract, should not change outputs or diagnostics.
+The name is provisional.
+
+The initial scope is compiler-API execution with classpath-based javac plugins.
+The implementation caches the loader for the complete annotation processor path used by plugin discovery; it does not independently select particular JARs or packages for reuse.
+Named processor modules and command-line javac execution are outside the implemented reuse path.
+The current wrapper also falls back to its delegate when the delegate's loader is not a `URLClassLoader`.
+
+The compatibility contract applies to all plugin code and dependencies defined by the cached loader:
+
+* No mutable static state shared between compilations.
+* No static maps or other retained references to compiler contexts, trees, symbols, processing environments, or other compilation-owned objects.
+* Support concurrent compilations using the same class definitions, with compilation-specific state held in fresh instances or contexts.
+* Treat loader reuse as opportunistic: worker termination, cache eviction, parent changes, or classpath changes can produce a fresh loader.
+
+Immutable static constants can remain available across compilations.
+The contract is an opt-in requirement, not a property the prototype dynamically detects or a completed audit of all Error Prone/NullAway dependencies.
+
+=== Integration with existing Gradle plugins
+
+The https://github.com/tbroyer/gradle-errorprone-plugin[Error Prone Gradle plugin] already wires Error Prone dependencies into source-set annotation processor configurations and configures `JavaCompile` tasks.
+The https://github.com/tbroyer/gradle-nullaway-plugin[NullAway Gradle plugin] exposes configuration for the Error Prone check.
+These are natural places to expose or configure the opt-in once compatibility is established.
+
+No changes to those plugins were necessary for the benchmark: the generated build uses their published releases and sets the new Gradle property directly.
+A plugin integration should consider additional custom javac plugins and checks on the same path before enabling reuse.
+
+A separate dependency configuration such as `persistentAnnotationProcessor` could express eligibility, but would still need a defined loading model when eligible and ineligible code coexist.
+For the first use case, a task option keeps the dependency graph and existing plugin wiring intact.
+Upstream discussion should settle the API and naming rather than treating the prototype property as final.
+
+== Prototype implementation
+
+=== Cache identity and concurrency
+
+`CompilerPluginClassLoaderCache` is a lazily initialized, process-local cache.
+The key includes the ordered classpath file list, SHA-256 content fingerprints for its entries, and parent-classloader identity.
+Directory entries include file names and contents, including resources.
+Each acquisition currently reads and hashes the classpath contents.
+
+Concurrent acquisitions for the same key return exactly the same cached `URLClassLoader`.
+The cache synchronizes bookkeeping, not compilation.
+There is no loader pool, exclusive compilation lease, state cleanup, or plugin-field inspection.
+Borrower counts only protect resources from closing while a compilation uses them.
+Separate compiler JVMs naturally have separate caches.
+
+The cache targets eight entries with least-recently-used ordering.
+Unused entries can be evicted; active entries can temporarily exceed the target.
+The count limits cached entries, not bytes of retained classes or heap.
+
+=== Loader closure and invalidation
+
+javac closes its processor-path loader after compilation.
+The cached loader therefore makes that `close()` call a no-op; the cache owns actual closure of its resources.
+Closing the Gradle file-manager wrapper releases the compilation's reference.
+Eviction or cache shutdown closes unused loaders, while active loaders close after their last borrower releases them.
+
+Changed content produces a different key, including when file size and modification time are unchanged.
+The implementation also retires obsolete idle loaders that reference a changed JAR, including loaders for other classpaths sharing that path.
+This matters because retained old JAR handles and JVM resource-connection caching can otherwise expose stale resources after replacement.
+A regression test reproduced that behavior below the cache's capacity before the fix was added.
+
+The prototype still loads files from their original locations.
+It does not provide immutable snapshots when a JAR is replaced during an active compilation.
+Concurrent mutation and Windows file locking need production handling.
+
+=== Source map
+
+Paths below are relative to the repository root:
+
+[cols="2,3",options="header"]
+|===
+|File or type |Role
+|`platforms/jvm/jvm-compiler-worker/src/main/java/org/gradle/api/tasks/compile/CompileOptions.java` |Public opt-in, default, and compatibility contract.
+|`platforms/jvm/java-compiler-worker/src/main/java/org/gradle/api/internal/tasks/compile/MinimalJavaCompileOptions.java` |Worker-side option transport.
+|`platforms/jvm/java-compiler-worker/src/main/java/org/gradle/api/internal/tasks/compile/JdkJavaCompiler.java` |Passes the option to the file-manager wrapper.
+|`platforms/jvm/java-compiler-worker/src/main/java/org/gradle/api/internal/tasks/compile/reflect/GradleStandardJavaFileManager.java` |Acquires and releases the plugin loader.
+|`platforms/jvm/java-compiler-worker/src/main/java/org/gradle/api/internal/tasks/compile/reflect/CompilerPluginClassLoaderCache.java` |Identity, sharing, invalidation, eviction, and resource ownership.
+|`platforms/jvm/java-compiler-worker/src/main/java/org/gradle/api/internal/tasks/compile/AnnotationProcessingCompileTask.java` |Existing ordinary annotation-processor path; unchanged.
+|`platforms/jvm/java-compiler-worker/src/main/java/org/gradle/api/internal/tasks/compile/JavaHomeBasedJavaCompilerFactory.java`, `JdkTools.java` |Existing javac/compiler-support reuse; unchanged.
+|===
+
+== Measurement methodology
+
+=== Environment and versions
+
+[cols="1,3",options="header"]
+|===
+|Item |Recorded value
+|OS and architecture |macOS 15.7.9, arm64
+|Compiler JDK |Temurin 25.0.4.1+1
+|Source base |`cf62537f12da36410a3b02b1ae24b2b7bdfe4c82`, plus the prototype
+|Development distribution |`9.9.0-20261017070000+0000`, built from this checkout
+|Error Prone |2.50.0
+|NullAway |0.14.2
+|Error Prone Gradle plugin |`net.ltgt.errorprone` 5.1.1
+|NullAway Gradle plugin |`net.ltgt.nullaway` 3.3.0
+|Plugin classpath |23 entries, 22,503,934 bytes
+|===
+
+The versions are pinned experiment inputs, not claims about the newest available releases.
+`results.json` records the environment, raw samples, and SHA-256 hashes of the five changed production sources used for the completed-prototype measurements.
+
+=== End-to-end Gradle builds
+
+The generated workload has 16 independent modules.
+Each contains 20 Java classes with 10 methods per class, plus a package nullness annotation: 40,032 Java lines overall.
+Methods exercise nullable inputs, null checks, collections, loops, and string construction.
+The packages are `@NullMarked`.
+
+The measured builds run the published Error Prone and NullAway Gradle plugins with NullAway enabled and other Error Prone checks disabled.
+They use compiler workers, configuration caching, and parallel project execution.
+Compiler incremental compilation and build caching are disabled, and `compileJava --rerun-tasks --no-build-cache` forces all compilation tasks to execute.
+Task-completion events verify all 16 tasks ran and record their durations.
+
+Each worker-count experiment excludes two warmup builds per variant.
+Variant order alternates between build pairs.
+The serial experiment measures six builds per variant; the four-worker experiment measures four.
+Reported end-to-end time covers the Gradle command invocation, including client and build overhead, rather than summing task durations.
+Both modes retain compiler JVMs and javac classes.
+The enabled mode includes content hashing on every loader acquisition.
+
+=== Exploratory compiler-only experiment
+
+An earlier experiment repeatedly invokes the compiler API within one JVM per fork.
+It obtains a `JavaCompiler` once per fork and creates a fresh standard file manager, wrapped file manager, and compilation task for every invocation.
+Each invocation compiles one 2,502-line module.
+The two analyses are NullAway with other Error Prone checks disabled, and Error Prone default checks with NullAway disabled.
+
+There are four JVM forks per variant, each with six excluded warmups and sixteen measured invocations: 64 measured samples per variant and analysis.
+Variant order alternates by fork.
+Recorded counters include loaded classes, process CPU, JVM-wide JIT time, GC time, and metaspace usage.
+
+This exploratory experiment predates the final JAR-invalidation hardening and used a wrapper milestone distribution with a matching `JdkJavaCompiler` adapter.
+It explains the mechanism; the final end-to-end experiments above use the completed implementation and source-built development distribution.
+
+=== Small incremental builds with the build cache enabled
+
+The incremental follow-up uses the same completed prototype, versions, generated 16-module project, class sizes, and source-built distribution.
+It enables `options.incremental`, enables the local build cache, and runs `compileJava --build-cache --info` without forcing tasks to rerun.
+Configuration caching and persistent compiler workers remain enabled.
+Two scenarios are measured: one file edited in one module with one worker, and one file edited in each of the 16 modules with four workers.
+The latter represents a batch of small incremental compilations, rather than a single-file developer edit.
+
+Each invocation changes one string literal in an existing method body in `Example0.java` in each selected module, preserving its public API.
+The source file contains ten methods and approximately 125 lines.
+The literal is unique to the run, iteration, variant, and module, so fresh edited inputs do not already have build-cache entries.
+The build cache remains active for lookups and writes, and the measured time includes those costs.
+The seed build can restore cached outputs; initial seed logs show cache restores in both scenarios.
+Each reuse mode also receives an untimed no-change control that must leave every compile task up-to-date.
+
+Each scenario excludes six warmup builds per variant, then records sixteen measured builds per variant with alternating order between pairs.
+The benchmark verifies every warmup and measured invocation:
+
+* Only changed modules have executed compile tasks; all other modules are up-to-date. Edited tasks must not restore from cache.
+* Every edited task computes a build-cache key and stores its new output in the cache.
+* Gradle reports incremental compilation of exactly one class per changed module, with no full recompilation.
+* Source-file logging shows that only the selected `Example0.java` files reach the compiler.
+* Comparing class-file content hashes before and after the build finds changes only in the expected `Example0.class` outputs.
+
+All measured samples reuse the configuration cache.
+Task durations come from the tooling task-completion events; wall time includes the Gradle client, task graph, up-to-date checks, build-cache operations, and incremental analysis.
+`--info` and source-file logging remain enabled in both variants for these assertions, so these times include diagnostic instrumentation.
+The reported incremental runs were performed sequentially, with no other benchmark running concurrently.
+
+== Results and interpretation
+
+=== Completed prototype: end-to-end builds
+
+[cols="1,1,1,1,1,1",options="header"]
+|===
+|Compiler workers |Samples per variant |Reuse off, median |Reuse on, median |Speedup |Wall-time reduction
+|1 |6 |6.757 s |2.000 s |3.38x |70.4%
+|4 |4 |2.892 s |1.107 s |2.61x |61.7%
+|===
+
+With one worker, measured times ranged from 6.605 to 6.781 seconds without reuse and 1.970 to 2.081 seconds with reuse.
+With four workers, the ranges were 2.838 to 3.038 seconds and 0.943 to 1.192 seconds, respectively.
+These are observed ranges from small samples, not confidence intervals.
+
+=== Completed prototype: small incremental builds
+
+Both scenarios below enable incremental compilation, the build cache, configuration caching, and persistent compiler workers.
+Each row has sixteen measured builds per variant after six excluded warmups per variant.
+
+[cols="2,1,1,1,1,1",options="header"]
+|===
+|Edit scenario |Workers |Reuse off, median |Reuse on, median |Speedup |Wall-time reduction
+|One file in one module; other 15 modules up-to-date |1 |0.680 s |0.489 s |1.39x |28.0%
+|One file in each of 16 modules |4 |1.483 s |0.680 s |2.18x |54.1%
+|===
+
+For the single-file scenario, measured wall times ranged from 0.654 to 0.743 seconds without reuse and 0.475 to 0.507 seconds with reuse.
+For the batch scenario, the ranges were 1.421 to 1.693 seconds and 0.615 to 0.740 seconds, respectively.
+All 32 measured builds in each scenario reused the configuration cache.
+All expected incremental class-count, source-file, task-outcome, and output-hash assertions passed, including the warmups.
+
+[cols="2,1,1,1",options="header"]
+|===
+|Executed compile-task duration |Reuse off, median |Reuse on, median |Speedup
+|Single changed task |240.5 ms |48.5 ms |4.96x
+|Sum of 16 changed task durations in the parallel batch |4,104.0 ms |897.5 ms |4.57x
+|===
+
+The second row sums overlapping task durations; it is not elapsed build time.
+In the single-file case, the changed task saves about 192 milliseconds and the end-to-end build saves about 191 milliseconds.
+Subtracting the median task duration from the median build time leaves roughly 440 milliseconds in both variants, illustrating how other build work limits the overall speedup.
+This arithmetic explains the observed scale; it is not a profile-based attribution of every millisecond.
+
+The incremental results therefore demonstrate a substantial reduction in the cost of one small compilation even when the total build improves by a more modest factor.
+The batch shows how repeated small compilations can add up across a task graph.
+These remain synthetic measurements, rather than real-project edit benchmarks.
+
+=== Exploratory compiler-only results
+
+[cols="2,1,1,1,1,1",options="header"]
+|===
+|Analysis |Reuse off, median |Reuse on, median |Speedup |Mean classes loaded, off |Mean classes loaded, on
+|NullAway |427.9 ms |112.2 ms |3.81x |1,651.31 |0.19
+|Error Prone defaults |867.8 ms |356.7 ms |2.43x |2,302.13 |0.19
+|===
+
+The class-loading counter is JVM-wide; it is not a package-filtered count of NullAway classes.
+Its near-elimination with reuse supports repeated plugin loading as an important source of overhead.
+Fresh class definitions also repeat initialization and execution warmup, even though their bytecode comes from the same JARs.
+Java class identity includes the defining loader; see the https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-5.html#jvms-5.3[JVM specification].
+
+Mean JVM-wide JIT counter deltas fell from 802.5 to 341.5 milliseconds for the NullAway workload, and from 1,362.0 to 406.6 milliseconds for Error Prone defaults.
+These counters include asynchronous compiler-thread activity throughout the JVM.
+They are not plugin-only measurements and must not be subtracted from wall time to attribute savings.
+See the https://docs.oracle.com/en/java/javase/25/docs/api/java.management/java/lang/management/CompilationMXBean.html[CompilationMXBean API].
+
+The workload has many small compilations, so repeated startup work is a large fraction of total compilation time.
+The exploratory NullAway difference is about 316 milliseconds per invocation; across 16 serial invocations that is about 5 seconds, broadly consistent with the completed build's 4.76-second reduction.
+This is a consistency check across separate experiments, not an exact causal decomposition.
+
+=== Limits of the evidence
+
+* The workload is synthetic, on one machine and one compiler JDK. Real dependency graphs, source complexity, diagnostics, and plugin options can change the outcome.
+* The full-recompilation and incremental experiments use different execution modes. The incremental runs keep the build cache enabled, and measure cache misses caused by unique source edits, rather than cache-hit latency.
+* The completed-prototype end-to-end measurements cover the NullAway workload. Error Prone default-check timings are exploratory compiler-only results.
+* Warm builds and reusable worker JVMs are intentional. Cold JVM startup and short-lived CI workers need separate measurements.
+* No long-running heap-retention audit, package-level profile, or precise allocation/JIT attribution has been completed.
+* Correctness checks do not prove all plugin versions, optional modes, custom checks, and dependencies satisfy the static-state contract.
+
+== Correctness and validation
+
+Eighteen focused test cases passed:
+
+* Nine cache cases cover javac closing the loader, directory resources, content replacement with unchanged size and timestamp, atomic JAR replacement below capacity for matching and differing classpaths, classpath order and parent identity, active-loader protection and eviction, eight concurrent borrowers receiving one loader, and deferred closure on shutdown.
+* Five `CompileOptionsTest` cases passed, including the new disabled-by-default assertion.
+* Four integration cases cover opt-in enabled/disabled and forked/in-process compilation. Two tasks and a subsequent changed-source build demonstrate loader identity reuse. Ordinary annotation processors receive fresh loaders in every case.
+
+The integration identity probe uses an immutable static UUID string, so preserving it demonstrates reuse without introducing shared mutable compilation state.
+The cache concurrency test establishes simultaneous sharing directly; the four-worker build measures performance across separate worker JVMs.
+
+A separate verification using the completed prototype adds an actual NullAway error, checks the failing exit status and `[NullAway]` diagnostic, removes the error, and verifies successful compilation with reuse enabled.
+This guards against the performance improvement merely skipping the check.
+The incremental follow-up also inserts a real NullAway error into the existing edited class and checks failure, then makes a new valid edit and checks recovery in both reuse modes with the build cache enabled.
+Gradle reports exactly one incrementally compiled class on each failure and recovery; the valid edits execute rather than restore from cache.
+These checks do not constitute the full Gradle test suite or a cross-platform compatibility run.
+
+== Relationship to Bazel
+
+https://bazel.build/remote/persistent[Bazel persistent workers] provide a relevant architectural precedent for amortizing tool startup.
+In the inspected JavaBuilder https://github.com/bazelbuild/bazel/blob/master/src/java_tools/buildjar/java/com/google/devtools/build/buildjar/javac/BlazeJavacMain.java[source], `ClassloaderMaskingFileManager` creates a fresh processor-path loader but delegates Error Prone and selected dependency packages to JavaBuilder's loader.
+Those built-in classes can therefore remain loaded in the worker, while external checks can still be defined by a fresh child loader.
+
+This supports the idea of retaining analysis-tool classes, but does not establish that arbitrary external checks such as NullAway already receive the same treatment in every Bazel toolchain.
+The Gradle prototype retains the whole opted-in plugin-path loader instead of bundling Error Prone into Gradle's compiler worker.
+No Bazel benchmark or toolchain patch was performed.
+
+== Production work and upstream design questions
+
+. *Lifecycle ownership:* replace the process-local singleton and shutdown hook with an appropriate compiler-worker/daemon service. Define cache clearing under worker expiration and memory pressure.
+. *Classpath identity:* integrate Gradle's existing classpath snapshots or hashing services to avoid rereading all JAR bytes on each compilation while preserving resource-sensitive invalidation.
+. *Immutable artifacts:* load mutable inputs from stable snapshots to handle Windows locking, active compilations during replacement, and JAR resource caching consistently. These are versioned artifacts, not extra loaders for isolating mutable plugin state.
+. *API and eligibility:* agree on the task option, naming, opt-in scope, behavior for unsupported execution modes, and how companion plugins surface the contract.
+. *Compatibility:* exercise supported JDKs and operating systems, toolchain/parent changes, exceptions, cancellation, worker restarts, changed options, and user-supplied checks. Validate output and diagnostic equivalence.
+. *Performance and retention:* benchmark real multi-module projects, repeated one-file edits, large compilations, and cold builds. Run hundreds of compilations and inspect retained heap/metaspace after GC. Use profiling to distinguish loading, initialization, JIT, and allocation costs.
+
+The initial proposal can stay focused on javac plugins.
+Ordinary annotation-processor reuse would need its own opt-in semantics and compatibility/performance evidence, potentially reusing the eventual cache infrastructure.
+
+== Reproduction and artifacts
+
+The prototype is on local branch `codex/compiler-plugin-classloader-reuse`, based on the source revision recorded above.
+Commit `3847e29851a` contains the initial prototype, report, and full-recompilation measurements; the subsequent incremental-benchmark commit updates the harness and report without changing production implementation sources.
+This directory contains:
+
+* `benchmark.py`: fixture generation, disposable-distribution patching, Gradle/compilation timings, and diagnostic verification.
+* `CompilerPluginBenchmark.java`: compiler-only harness.
+* `results.json`: raw samples, source hashes, test summaries, and verification metadata. The `gradle_incremental_completed_prototype` section holds the follow-up incremental data and its provenance.
+* `results.adoc`: compact results summary.
+* `README.adoc`: setup and reproduction instructions.
+* `report.adoc`: this report and suggested upstream issue framing.
+
+Build a development distribution and use an isolated Gradle user home for experiments:
+
+[source,bash]
+----
+GRADLE_USER_HOME=/tmp/gradle-loader-build-home ./gradlew :distributions-jvm:binInstallation
+
+python3 testing/performance/fixtures/compiler-plugin-classloader-reuse/benchmark.py \
+  --gradle-home 'platforms/jvm/distributions-jvm/build/bin distribution' \
+  --java-home /path/to/jdk-25 \
+  --user-home /tmp/gradle-loader-benchmark-home \
+  --work-dir /tmp/gradle-loader-serial \
+  --workers 1 --gradle-builds 6
+----
+
+Use a separate work directory with `--workers 4 --gradle-builds 4` to match the parallel experiment.
+The default phase runs preparation, compiler-only measurements, Gradle measurements, and verification.
+The script compiles the five changed production sources and installs them into a disposable copy of the supplied distribution.
+It does not alter the supplied distribution.
+See `README.adoc` for individual phases and the adapter needed only for reproducing the earlier wrapper-milestone experiment.
+
+For incremental measurements, use a separate work directory and run the command with `--phase prepare` first, followed by `--phase incremental --workers 1 --changed-modules 1 --incremental-warmups 6 --incremental-builds 16`.
+For the parallel batch, use another work directory and `--workers 4 --changed-modules 16` for both phases.
+The explicit incremental phase enables the build cache and incremental compilation itself.
+It is not part of the original `--phase all` workflow.
+Run `--phase verify-incremental` in the single-file work directory afterward to reproduce the incremental NullAway diagnostic and recovery checks for both reuse modes.
+
+Focused validation command:
+
+[source,bash]
+----
+./gradlew \
+  :java-compiler-worker:test --tests '*CompilerPluginClassLoaderCacheTest' \
+  :language-java:test --tests '*CompileOptionsTest' \
+  :language-java:forkingIntegTest --tests '*JavaCompilerPluginClassLoaderReuseIntegrationTest'
+----
+
+== Suggested upstream issue framing
+
+Suggested title: *Allow opt-in reuse of javac plugin classloaders across compilations*.
+
+Gradle retains compiler JVMs and javac classes, but javac plugins such as Error Prone and its NullAway check are loaded through a fresh processor-path classloader for each compiler invocation.
+Even a small incremental compilation must load and warm the plugin classes it uses again.
+
+Could Gradle expose an opt-in for plugins whose classes can safely remain loaded across compilations, including concurrent compilations?
+The opt-in would require plugins and their dependencies to avoid mutable static state and references that retain previous compilation objects.
+Each compilation would still get fresh plugin instances and compiler contexts.
+
+A prototype adds `CompileOptions.compilerPluginClassLoaderReuse`, disabled by default, and caches the javac plugin loader by ordered classpath contents and parent identity.
+It shares one matching loader directly, with resource-lifetime tracking and eviction.
+Ordinary annotation-processor loaders remain fresh.
+Existing Error Prone/NullAway Gradle plugins can continue supplying dependencies and could surface the opt-in.
+
+On a synthetic 16-module, 40,032-line NullAway workload, warm end-to-end builds improved from 6.757 to 2.000 seconds with one worker (3.38x), and from 2.892 to 1.107 seconds with four workers (2.61x).
+All modules were fully recompiled; build caching and incremental compilation were disabled, and both modes retained javac and worker JVMs.
+An earlier compiler-only experiment reduced newly loaded classes from about 1,651 per NullAway invocation to fewer than one after warmup.
+
+A follow-up enables incremental compilation and the build cache and makes unique method-body edits without forcing tasks to rerun.
+For one file edited in one module, with the other 15 modules up-to-date, median build time improves from 0.680 to 0.489 seconds (1.39x), and the changed compile task improves from 240.5 to 48.5 milliseconds (4.96x).
+A batch with one edited file per module and four workers improves from 1.483 to 0.680 seconds (2.18x).
+Each variant has sixteen measured builds after six warmups; task outcomes, exact source files, one-class incremental counts, and changed output hashes are verified on every invocation.
+
+These results show potential rather than typical production savings.
+Real-project incremental timings and long-running retention measurements remain open.
+The prototype has 18 passing focused cases and a real NullAway diagnostic/recovery check; production work includes service-owned lifecycle, integration with classpath snapshots, and stable handling of mutable JARs.
+
+The proposed discussion is whether this opt-in capability belongs in Gradle, which API and compatibility contract would be appropriate, and which additional validation maintainers would want before implementation proceeds.
+The accompanying prototype, raw measurements, reproduction harness, and full report provide the supporting evidence.

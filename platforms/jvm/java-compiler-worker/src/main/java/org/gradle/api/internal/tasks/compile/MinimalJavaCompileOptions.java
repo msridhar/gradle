@@ -40,6 +40,7 @@ public class MinimalJavaCompileOptions implements Serializable {
     private boolean listFiles;
     private boolean verbose;
     private boolean warnings;
+    private boolean compilerPluginClassLoaderReuse;
     private File annotationProcessorGeneratedSourcesDirectory;
     private File headerOutputDirectory;
     private String javaModuleVersion;
@@ -64,6 +65,7 @@ public class MinimalJavaCompileOptions implements Serializable {
         this.listFiles = compileOptions.isListFiles();
         this.verbose = compileOptions.isVerbose();
         this.warnings = compileOptions.isWarnings();
+        this.compilerPluginClassLoaderReuse = compileOptions.getCompilerPluginClassLoaderReuse().getOrElse(false);
         this.annotationProcessorGeneratedSourcesDirectory = compileOptions.getGeneratedSourceOutputDirectory().getAsFile().getOrNull();
         this.headerOutputDirectory = compileOptions.getHeaderOutputDirectory().getAsFile().getOrNull();
         this.javaModuleVersion = compileOptions.getJavaModuleVersion().getOrNull();
@@ -74,6 +76,10 @@ public class MinimalJavaCompileOptions implements Serializable {
     @Nullable
     private static String getAsPath(@Nullable FileCollection files) {
         return files == null ? null : files.getAsPath();
+    }
+
+    public boolean isCompilerPluginClassLoaderReuse() {
+        return compilerPluginClassLoaderReuse;
     }
 
     public List<File> getSourcepath() {

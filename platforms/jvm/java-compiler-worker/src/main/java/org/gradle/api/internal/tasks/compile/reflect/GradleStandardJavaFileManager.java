@@ -17,6 +17,7 @@
 package org.gradle.api.internal.tasks.compile.reflect;
 
 import org.gradle.internal.classpath.ClassPath;
+import org.jspecify.annotations.Nullable;
 
 import javax.tools.ForwardingJavaFileManager;
 import javax.tools.JavaFileManager;
@@ -32,11 +33,14 @@ import static org.gradle.api.internal.tasks.compile.filter.AnnotationProcessorFi
 public class GradleStandardJavaFileManager extends ForwardingJavaFileManager<StandardJavaFileManager> {
     private final ClassPath annotationProcessorPath;
     private final boolean hasEmptySourcePaths;
+    private final boolean reusePluginClassLoader;
+    private CompilerPluginClassLoaderCache.@Nullable Lease pluginClassLoader;
 
-    private GradleStandardJavaFileManager(StandardJavaFileManager fileManager, ClassPath annotationProcessorPath, boolean hasEmptySourcePaths) {
+    private GradleStandardJavaFileManager(StandardJavaFileManager fileManager, ClassPath annotationProcessorPath, boolean hasEmptySourcePaths, boolean reusePluginClassLoader) {
         super(fileManager);
         this.annotationProcessorPath = annotationProcessorPath;
         this.hasEmptySourcePaths = hasEmptySourcePaths;
+        this.reusePluginClassLoader = reusePluginClassLoader;
     }
 
     /**
@@ -44,7 +48,11 @@ public class GradleStandardJavaFileManager extends ForwardingJavaFileManager<Sta
      * classloaders outside of Gradle's control.
      */
     public static JavaFileManager wrap(StandardJavaFileManager delegate, ClassPath annotationProcessorPath, boolean hasEmptySourcePaths) {
-        return new GradleStandardJavaFileManager(delegate, annotationProcessorPath, hasEmptySourcePaths);
+        return wrap(delegate, annotationProcessorPath, hasEmptySourcePaths, false);
+    }
+
+    public static JavaFileManager wrap(StandardJavaFileManager delegate, ClassPath annotationProcessorPath, boolean hasEmptySourcePaths, boolean reusePluginClassLoader) {
+        return new GradleStandardJavaFileManager(delegate, annotationProcessorPath, hasEmptySourcePaths, reusePluginClassLoader);
     }
 
     @Override
@@ -83,13 +91,32 @@ public class GradleStandardJavaFileManager extends ForwardingJavaFileManager<Sta
 
     @Override
     public ClassLoader getClassLoader(Location location) {
+        if (location.equals(StandardLocation.ANNOTATION_PROCESSOR_PATH) && pluginClassLoader != null) {
+            return pluginClassLoader.getClassLoader();
+        }
         ClassLoader classLoader = super.getClassLoader(location);
         if (location.equals(StandardLocation.ANNOTATION_PROCESSOR_PATH)) {
             if (classLoader instanceof URLClassLoader) {
+                if (reusePluginClassLoader) {
+                    pluginClassLoader = CompilerPluginClassLoaderCache.shared().acquire(annotationProcessorPath, classLoader.getParent());
+                    return pluginClassLoader.getClassLoader();
+                }
                 return new URLClassLoader(annotationProcessorPath.getAsURLArray(), getFilteredClassLoader(classLoader.getParent()));
             }
         }
 
         return classLoader;
+    }
+
+    @Override
+    public void close() throws IOException {
+        try {
+            super.close();
+        } finally {
+            if (pluginClassLoader != null) {
+                pluginClassLoader.close();
+                pluginClassLoader = null;
+            }
+        }
     }
 }
